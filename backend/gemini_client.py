@@ -1,12 +1,15 @@
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dotenv import load_dotenv
 from google import genai
 
 load_dotenv()
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+GEMINI_TIMEOUT_SECONDS = 15
+GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 PERSONAS = {
     "student":  "a student learning about AI fairness for the first time",
@@ -21,8 +24,22 @@ def _is_api_error(e: Exception) -> bool:
     return any(code in err for code in [
         "429", "RESOURCE_EXHAUSTED",
         "400", "INVALID_ARGUMENT",
-        "API_KEY_INVALID", "API Key not found"
+        "API_KEY_INVALID", "API Key not found",
+        "GEMINI_TIMEOUT", "TIMEOUT", "timed out"
     ])
+
+
+def _generate_content_with_timeout(prompt: str, timeout_seconds: int = GEMINI_TIMEOUT_SECONDS):
+    future = GEMINI_EXECUTOR.submit(
+        client.models.generate_content,
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError as exc:
+        future.cancel()
+        raise TimeoutError("GEMINI_TIMEOUT") from exc
 
 
 def _fallback_explanation(bias_report) -> str:
@@ -85,32 +102,29 @@ def explain_results(bias_report, shap_data, audience="ngo"):
     persona = PERSONAS.get(audience, PERSONAS["ngo"])
 
     prompt = f"""
-You are an AI fairness expert explaining bias analysis results to {persona}.
+You are an AI fairness expert. Be extremely concise.
 
-Here is what was found:
-- Groups analyzed: {bias_report['group_stats']}
-- Disparate Impact Ratio: {bias_report['di']} (below 0.8 means discriminatory)
-- Statistical Parity Difference: {bias_report['spd']} (above 0.1 means biased)
+Bias analysis results:
+- Groups: {bias_report['group_stats']}
+- Disparate Impact: {bias_report['di']} (below 0.8 = biased)
+- Outcome gap: {bias_report['spd']} (above 0.1 = biased)
 - Severity: {bias_report['severity']}
-- Most influential features: {shap_data['top_features']}
+- Top features driving decisions: {shap_data['top_features']}
 
-Write exactly 3 short paragraphs:
-1. What bias was found and which group is most affected
-2. Why this matters in real life with one concrete example
-3. Two specific actions to fix this bias
+Write exactly 3 sentences. No more.
+Sentence 1: Which group is disadvantaged and by how much (use the actual numbers).
+Sentence 2: Which feature(s) are causing it and why that's a problem.
+Sentence 3: One specific fix.
 
 Rules:
-- No technical jargon
-- No bullet points inside paragraphs
-- Plain simple language only
-- Keep each paragraph under 4 sentences
+- No intros, no conclusions, no filler
+- Use plain language suited for {persona}
+- Name the actual columns, not generic terms
+- Total response must be under 60 words
 """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
+        response = _generate_content_with_timeout(prompt)
         return response.text
     except Exception as e:
         if _is_api_error(e):
@@ -129,10 +143,7 @@ Example format: ["fix 1", "fix 2", "fix 3"]
 """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
+        response = _generate_content_with_timeout(prompt)
         try:
             return _parse_json(response.text)
         except (ValueError, json.JSONDecodeError):
@@ -171,43 +182,26 @@ def explain_whatif(original, modified, delta, dropped_features, audience="ngo"):
 
     di_threshold_crossed = original["di"] < 0.8 and modified["di"] >= 0.8
 
-    prompt = f"""
-You are an AI fairness expert explaining a what-if simulation to {persona}.
+    prompt = f"""Be extremely concise. 3 sentences max.
 
-The user removed these features from their dataset: {dropped_str}
+Features dropped: {dropped_str}
+Audience: {persona}
 
-Before removing:
-- Disparate Impact: {original['di']} (below 0.8 = discriminatory)
-- Statistical Parity Difference: {original['spd']}
-- Equalized Odds: {original['eod']}
-- Severity: {original['severity']}
+Before → After:
+- Disparate Impact: {original['di']:.3f} → {modified['di']:.3f} (need ≥ 0.8)
+- SPD: {original['spd']:.3f} → {modified['spd']:.3f} (need ≤ 0.1)
+- Equalized Odds: {original['eod']:.3f} → {modified['eod']:.3f} (need ≤ 0.1)
+- Threshold crossed: {di_threshold_crossed}
 
-After removing:
-- Disparate Impact: {modified['di']}
-- Statistical Parity Difference: {modified['spd']}
-- Equalized Odds: {modified['eod']}
-- Severity: {modified['severity']}
+Sentence 1: What improved and what got worse, using the actual numbers.
+Sentence 2: Is the model fair now? Yes or no, with the DI number.
+Sentence 3: One specific next step.
 
-Changes: {{'improved': {improved}, 'worsened': {worsened}}}
-Legal threshold crossed (DI now above 0.8): {di_threshold_crossed}
-
-Write exactly 2 short paragraphs:
-1. What changed after removing these features, and whether it helped reduce bias
-2. Whether the model is now fair enough, and what to do next
-
-Rules:
-- No technical jargon
-- Plain simple language only
-- No bullet points inside paragraphs
-- Each paragraph under 4 sentences
-- Be honest if removing the features made things worse
+Hard limit: under 50 words total. No filler, no intros.
 """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
+        response = _generate_content_with_timeout(prompt)
         return response.text
     except Exception as e:
         if _is_api_error(e):
